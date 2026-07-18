@@ -1,4 +1,5 @@
 {
     "ffmpeg_path": "D:/Program Files (x86)/ffmpeg-8.1.2-essentials_build/bin/ffmpeg.exe",
-    "ffprobe_path": "D:/Program Files (x86)/ffmpeg-8.1.2-essentials_build/bin/ffprobe.exe"
+    "ffprobe_path": "D:/Program Files (x86)/ffmpeg-8.1.2-essentials_build/bin/ffprobe.exe",
+
 }
