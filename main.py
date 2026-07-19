@@ -1,6 +1,15 @@
-import json
+from src.config.config_manager import ConfigManager
 
-with open("config.json", "r", encoding="utf-8") as f:
-    config = json.load(f)
 
-FFMPEG = config["ffmpeg_path"] + "/ffmpeg.exe"
+def main():
+    config = ConfigManager()
+
+    print("FFmpeg:")
+    print(config.get("ffmpeg_path"))
+
+    print("FFprobe:")
+    print(config.get("ffprobe_path"))
+
+
+if __name__ == "__main__":
+    main()
