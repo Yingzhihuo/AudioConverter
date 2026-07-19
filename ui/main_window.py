@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.audio_codec import AudioCodec
+from src.models.audio_task import AudioTask
 
 
 class MainWindow(QMainWindow):
@@ -191,9 +192,62 @@ class MainWindow(QMainWindow):
                 folder
             )
 
-
     def convert(self):
 
-        self.log.append(
-            "开始转换..."
-        )
+        try:
+
+            input_file = self.input_edit.text()
+
+            output_dir = self.output_edit.text()
+
+            if not input_file:
+                self.log.append(
+                    "请选择输入文件"
+                )
+                return
+
+            if not output_dir:
+                self.log.append(
+                    "请选择输出目录"
+                )
+                return
+
+            codec = self.codec_box.currentData()
+
+            input_path = Path(
+                input_file
+            )
+
+            output_path = (
+                    Path(output_dir)
+                    /
+                    f"{input_path.stem}{codec.extension}"
+            )
+
+            task = AudioTask(
+
+                input_file=input_path,
+
+                output_file=output_path,
+
+                codec=codec
+            )
+
+            self.log.append(
+                "开始转换..."
+            )
+
+            self.converter.convert(
+                task
+            )
+
+            self.log.append(
+                f"转换完成:\n{output_path}"
+            )
+
+
+        except Exception as e:
+
+            self.log.append(
+                f"转换失败:\n{e}"
+            )
