@@ -12,30 +12,37 @@ class AudioConverter:
     ):
         self.ffmpeg = ffmpeg_service
 
-
     def convert(
-        self,
-        task: AudioTask
+            self,
+            task: AudioTask,
+            log_callback=None,
     ):
-
 
         if not task.input_file.exists():
             raise FileNotFoundError(
-                f"输入文件不存在: {task.input_file}"
+                task.input_file
             )
-
-
-        # 创建输出目录
 
         task.output_file.parent.mkdir(
             parents=True,
             exist_ok=True
         )
 
+        return self.ffmpeg.convert(task, log_callback=log_callback)
 
-        # 调用 FFmpeg
+    def convert_batch(
+            self,
+            tasks: list[AudioTask]
+    ):
+        results = []
 
-        result = self.ffmpeg.convert(task)
+        for task in tasks:
+            result = self.convert(
+                task
+            )
 
+            results.append(
+                result
+            )
 
-        return result
+        return results

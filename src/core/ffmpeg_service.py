@@ -21,7 +21,7 @@ class FFmpegService:
 
         return result.stdout.splitlines()[0]
 
-    def convert(self, task: AudioTask):
+    def convert(self, task: AudioTask, log_callback=None):
         command = [
             str(self.ffmpeg),
             "-y" if task.overwrite else "-n",
@@ -46,13 +46,33 @@ class FFmpegService:
 
         command.append(str(task.output_file))
 
-        result = subprocess.run(
+        if log_callback:
+            log_callback("执行命令: " + subprocess.list2cmdline(command))
+
+        # ffmpeg 将大部分运行信息写入 stderr；合并两个流后逐行读取，调用方即可
+        # 在转换尚未结束时把日志显示到界面中。
+        process = subprocess.Popen(
             command,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
         )
+        output_lines = []
 
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr)
+        assert process.stdout is not None
+        for line in process.stdout:
+            message = line.rstrip()
+            output_lines.append(message)
+            if log_callback and message:
+                log_callback(message)
 
-        return result
+        return_code = process.wait()
+        if return_code != 0:
+            raise RuntimeError(
+                "ffmpeg 转换失败（退出码 {}）".format(return_code)
+            )
+
+        return subprocess.CompletedProcess(command, return_code, "\n".join(output_lines))
