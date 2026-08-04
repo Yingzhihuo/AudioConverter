@@ -1,5 +1,8 @@
+import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 
 from src.models.audio_task import AudioTask
 
@@ -18,8 +21,92 @@ class FFmpegService:
             capture_output=True,
             text=True,
         )
-
         return result.stdout.splitlines()[0]
+
+    def _ffprobe_path(self) -> Path:
+        """Return the ffprobe executable installed next to ffmpeg."""
+        executable_name = "ffprobe.exe" if self.ffmpeg.suffix.lower() == ".exe" else "ffprobe"
+        return self.ffmpeg.with_name(executable_name)
+
+    def read_metadata(self, audio_file: Path) -> dict[str, str]:
+        """Read the common tags displayed by Windows Explorer."""
+        command = [
+            str(self._ffprobe_path()),
+            "-v",
+            "error",
+            "-show_entries",
+            "format_tags",
+            "-of",
+            "json",
+            str(audio_file),
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "无法读取音频信息")
+
+        raw_tags = json.loads(result.stdout or "{}").get("format", {}).get("tags", {})
+        tags = {key.lower(): str(value) for key, value in raw_tags.items()}
+        return {
+            "title": tags.get("title", ""),
+            "artist": tags.get("artist", tags.get("artists", "")),
+            "album": tags.get("album", ""),
+            "album_artist": tags.get("album_artist", tags.get("album artist", "")),
+            "genre": tags.get("genre", ""),
+            "date": tags.get("date", tags.get("year", "")),
+            "track": tags.get("track", ""),
+        }
+
+    def update_metadata(self, audio_file: Path, metadata: dict[str, str]):
+        """Update tags in place while copying all streams without re-encoding."""
+        audio_file = Path(audio_file)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                prefix=f".{audio_file.stem}_metadata_",
+                suffix=audio_file.suffix,
+                dir=audio_file.parent,
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+
+            command = [
+                str(self.ffmpeg),
+                "-y",
+                "-i",
+                str(audio_file),
+                "-map",
+                "0",
+                "-map_metadata",
+                "0",
+                "-c",
+                "copy",
+            ]
+            for key, value in metadata.items():
+                command.extend(["-metadata", f"{key}={value}"])
+            if audio_file.suffix.lower() == ".mp3":
+                command.extend(["-id3v2_version", "3"])
+            command.append(str(temporary_path))
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or "无法保存音频信息")
+            os.replace(temporary_path, audio_file)
+            temporary_path = None
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
 
     def convert(self, task: AudioTask, log_callback=None):
         command = [
@@ -30,27 +117,19 @@ class FFmpegService:
         ]
 
         if task.codec:
-            command.extend([
-                "-c:a",
-                task.codec.ffmpeg_codec
-            ])
-
+            command.extend(["-c:a", task.codec.ffmpeg_codec])
         if task.bitrate:
             command.extend(["-b:a", task.bitrate])
-
         if task.sample_rate:
             command.extend(["-ar", str(task.sample_rate)])
-
         if task.channels:
             command.extend(["-ac", str(task.channels)])
-
         command.append(str(task.output_file))
 
         if log_callback:
             log_callback("执行命令: " + subprocess.list2cmdline(command))
 
-        # ffmpeg 将大部分运行信息写入 stderr；合并两个流后逐行读取，调用方即可
-        # 在转换尚未结束时把日志显示到界面中。
+        # FFmpeg 将大部分运行信息写入 stderr。合并输出后逐行发送到界面。
         process = subprocess.Popen(
             command,
             stdout=subprocess.PIPE,
@@ -71,8 +150,6 @@ class FFmpegService:
 
         return_code = process.wait()
         if return_code != 0:
-            raise RuntimeError(
-                "ffmpeg 转换失败（退出码 {}）".format(return_code)
-            )
+            raise RuntimeError("FFmpeg 转换失败（退出码 {}）".format(return_code))
 
         return subprocess.CompletedProcess(command, return_code, "\n".join(output_lines))
