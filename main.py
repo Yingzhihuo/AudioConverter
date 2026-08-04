@@ -29,7 +29,8 @@ def main():
 
 
     window = MainWindow(
-        converter
+        converter,
+        output_dir=config.get("default_output") or "output",
     )
 
     window.show()
