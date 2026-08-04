@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMainWindow,
+    QMessageBox,
     QProgressBar,
     QPushButton,
     QTabWidget,
@@ -62,6 +63,8 @@ class MainWindow(QMainWindow):
         self.config = config
         self.output_dir = Path(output_dir)
         self.input_files = []
+        self.metadata_files = []
+        self.metadata_loaded = False
         self.thread = None
         self.worker = None
 
@@ -132,12 +135,89 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log)
         layout.addWidget(log_group, stretch=1)
 
+        self.init_metadata_page()
         self.init_settings_page()
+
+        # Settings remains a page, but its entry lives at the far right of the tab bar.
+        self.feature_tabs.tabBar().setTabVisible(self.settings_page_index, False)
+        self.settings_btn = QPushButton("\u8bbe\u7f6e")
+        self.settings_btn.clicked.connect(
+            lambda: self.feature_tabs.setCurrentIndex(self.settings_page_index)
+        )
+        self.feature_tabs.setCornerWidget(self.settings_btn, Qt.Corner.TopRightCorner)
         self.update_remove_button()
+
+    def init_metadata_page(self):
+        metadata_page = QWidget()
+        self.feature_tabs.addTab(metadata_page, "\u4fee\u6539\u4fe1\u606f")
+        layout = QVBoxLayout(metadata_page)
+
+        content_layout = QHBoxLayout()
+        layout.addLayout(content_layout, stretch=1)
+
+        file_group = QGroupBox("\u6d4f\u89c8\u6587\u4ef6")
+        file_layout = QVBoxLayout(file_group)
+        button_layout = QHBoxLayout()
+        self.metadata_choose_btn = QPushButton("\u9009\u62e9\u6587\u4ef6")
+        self.metadata_add_btn = QPushButton("\u589e\u52a0\u6587\u4ef6")
+        self.metadata_remove_btn = QPushButton("\u5220\u9664\u6587\u4ef6")
+        self.metadata_choose_btn.clicked.connect(self.choose_metadata_files)
+        self.metadata_add_btn.clicked.connect(self.add_metadata_files)
+        self.metadata_remove_btn.clicked.connect(self.remove_selected_metadata_file)
+        button_layout.addWidget(self.metadata_choose_btn)
+        button_layout.addWidget(self.metadata_add_btn)
+        button_layout.addWidget(self.metadata_remove_btn)
+        file_layout.addLayout(button_layout)
+
+        self.metadata_file_list = QListWidget()
+        self.metadata_file_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.metadata_file_list.currentRowChanged.connect(self.load_selected_metadata)
+        file_layout.addWidget(self.metadata_file_list, stretch=1)
+        content_layout.addWidget(file_group, stretch=2)
+
+        information_group = QGroupBox("\u4fee\u6539\u97f3\u9891\u4fe1\u606f")
+        information_layout = QGridLayout(information_group)
+        self.metadata_name_label = QLabel("\u8bf7\u5148\u9009\u62e9\u4e00\u4e2a\u97f3\u9891\u6587\u4ef6")
+        self.metadata_name_label.setWordWrap(True)
+        information_layout.addWidget(self.metadata_name_label, 0, 0, 1, 2)
+
+        field_labels = [
+            ("title", "\u6807\u9898"),
+            ("artist", "\u53c2\u4e0e\u521b\u4f5c\u7684\u827a\u672f\u5bb6"),
+            ("album", "\u4e13\u8f91"),
+            ("album_artist", "\u4e13\u8f91\u827a\u672f\u5bb6"),
+            ("genre", "\u6d41\u6d3e"),
+            ("date", "\u5e74\u4efd"),
+            ("track", "\u97f3\u8f68\u53f7"),
+        ]
+        self.metadata_edits = {}
+        for row, (key, label) in enumerate(field_labels, start=1):
+            information_layout.addWidget(QLabel(label), row, 0)
+            edit = QLineEdit()
+            edit.setEnabled(False)
+            information_layout.addWidget(edit, row, 1)
+            self.metadata_edits[key] = edit
+
+        self.metadata_status = QLabel("")
+        self.metadata_status.setWordWrap(True)
+        information_layout.addWidget(self.metadata_status, len(field_labels) + 1, 0, 1, 2)
+        information_layout.setRowStretch(len(field_labels) + 2, 1)
+
+        save_layout = QHBoxLayout()
+        save_layout.addStretch()
+        self.save_metadata_btn = QPushButton("\u4fdd\u5b58")
+        self.save_metadata_btn.setEnabled(False)
+        self.save_metadata_btn.clicked.connect(self.save_metadata)
+        save_layout.addWidget(self.save_metadata_btn)
+        information_layout.addLayout(save_layout, len(field_labels) + 3, 0, 1, 2)
+        information_layout.setColumnStretch(1, 1)
+        content_layout.addWidget(information_group, stretch=3)
+
+        self.update_metadata_controls()
 
     def init_settings_page(self):
         settings_page = QWidget()
-        self.feature_tabs.addTab(settings_page, "\u8bbe\u7f6e")
+        self.settings_page_index = self.feature_tabs.addTab(settings_page, "\u8bbe\u7f6e")
         layout = QVBoxLayout(settings_page)
         settings_group = QGroupBox("\u7a0b\u5e8f\u8bbe\u7f6e")
         settings_layout = QGridLayout(settings_group)
@@ -206,6 +286,98 @@ class MainWindow(QMainWindow):
         self.file_list.takeItem(row)
         self.append_log(f"\u5df2\u4ece\u5f85\u8f6c\u6362\u5217\u8868\u79fb\u9664\uff1a{Path(removed_file).name}")
         self.update_remove_button()
+
+    def choose_metadata_files(self):
+        files = self.open_audio_files()
+        if files:
+            self.set_metadata_files(files)
+
+    def add_metadata_files(self):
+        files = self.open_audio_files()
+        if not files:
+            return
+        existing = set(self.metadata_files)
+        added = [file for file in files if file not in existing]
+        current_row = self.metadata_file_list.currentRow()
+        self.set_metadata_files([*self.metadata_files, *added], current_row)
+
+    def set_metadata_files(self, files, selected_row=0):
+        self.metadata_files = files
+        self.metadata_file_list.blockSignals(True)
+        self.metadata_file_list.clear()
+        for file in files:
+            self.metadata_file_list.addItem(Path(file).name)
+            self.metadata_file_list.item(self.metadata_file_list.count() - 1).setToolTip(file)
+        self.metadata_file_list.blockSignals(False)
+        if files:
+            self.metadata_file_list.setCurrentRow(max(0, min(selected_row, len(files) - 1)))
+        else:
+            self.load_selected_metadata(-1)
+        self.update_metadata_controls()
+
+    def remove_selected_metadata_file(self):
+        row = self.metadata_file_list.currentRow()
+        if row < 0:
+            return
+        files = [*self.metadata_files]
+        files.pop(row)
+        self.set_metadata_files(files, min(row, len(files) - 1))
+
+    def update_metadata_controls(self):
+        has_selection = 0 <= self.metadata_file_list.currentRow() < len(self.metadata_files)
+        self.metadata_remove_btn.setEnabled(has_selection)
+        self.save_metadata_btn.setEnabled(has_selection and self.metadata_loaded)
+        for edit in self.metadata_edits.values():
+            edit.setEnabled(has_selection and self.metadata_loaded)
+
+    def clear_metadata_fields(self):
+        for edit in self.metadata_edits.values():
+            edit.clear()
+
+    def load_selected_metadata(self, row):
+        self.metadata_loaded = False
+        self.clear_metadata_fields()
+        self.metadata_status.clear()
+        if row < 0 or row >= len(self.metadata_files):
+            self.metadata_name_label.setText("\u8bf7\u5148\u9009\u62e9\u4e00\u4e2a\u97f3\u9891\u6587\u4ef6")
+            self.update_metadata_controls()
+            return
+
+        audio_file = Path(self.metadata_files[row])
+        self.metadata_name_label.setText(f"\u5f53\u524d\u6587\u4ef6：{audio_file.name}")
+        try:
+            metadata = self.converter.ffmpeg.read_metadata(audio_file)
+        except Exception as error:
+            self.metadata_status.setText(f"\u8bfb\u53d6\u5931\u8d25：{error}")
+            self.update_metadata_controls()
+            return
+
+        for key, edit in self.metadata_edits.items():
+            edit.setText(metadata.get(key, ""))
+        self.metadata_loaded = True
+        self.metadata_status.setText("\u5df2\u8bfb\u53d6\u97f3\u9891\u4fe1\u606f")
+        self.update_metadata_controls()
+
+    def save_metadata(self):
+        row = self.metadata_file_list.currentRow()
+        if row < 0 or row >= len(self.metadata_files):
+            return
+
+        audio_file = Path(self.metadata_files[row])
+        metadata = {key: edit.text().strip() for key, edit in self.metadata_edits.items()}
+        self.save_metadata_btn.setEnabled(False)
+        self.metadata_status.setText("\u6b63\u5728\u4fdd\u5b58……")
+        try:
+            self.converter.ffmpeg.update_metadata(audio_file, metadata)
+        except Exception as error:
+            self.metadata_status.setText(f"\u4fdd\u5b58\u5931\u8d25：{error}")
+            QMessageBox.critical(self, "\u4fdd\u5b58\u5931\u8d25", str(error))
+        else:
+            self.metadata_status.setText(
+                "\u4fdd\u5b58\u6210\u529f，Windows \u8d44\u6e90\u7ba1\u7406\u5668\u53ef\u80fd\u9700\u8981\u5237\u65b0\u540e\u663e\u793a\u65b0\u4fe1\u606f。"
+            )
+        finally:
+            self.update_metadata_controls()
 
     def select_output_dir(self):
         folder = QFileDialog.getExistingDirectory(self, "\u9009\u62e9\u8f93\u51fa\u76ee\u5f55", self.output_edit.text())
@@ -292,6 +464,7 @@ class MainWindow(QMainWindow):
         self.output_browse_btn.setEnabled(enabled)
         self.ffmpeg_browse_btn.setEnabled(enabled)
         self.save_settings_btn.setEnabled(enabled)
+        self.settings_btn.setEnabled(enabled)
         self.choose_btn.setEnabled(enabled)
         self.add_btn.setEnabled(enabled)
         self.codec_box.setEnabled(enabled)
