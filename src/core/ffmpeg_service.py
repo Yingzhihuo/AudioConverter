@@ -153,3 +153,4 @@ class FFmpegService:
             raise RuntimeError("FFmpeg 转换失败（退出码 {}）".format(return_code))
 
         return subprocess.CompletedProcess(command, return_code, "\n".join(output_lines))
+
