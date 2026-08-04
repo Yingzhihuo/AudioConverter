@@ -30,6 +30,7 @@ def main():
 
     window = MainWindow(
         converter,
+        config,
         output_dir=config.get("default_output") or "output",
     )
 
