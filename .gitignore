@@ -33,3 +33,14 @@ dist/
 
 .DS_Store
 Thumbs.db
+
+#config
+config.json
+
+#test
+test.m4a
+test1.m4a
+output/
+
+#FFmpeg binaries
+tools/
