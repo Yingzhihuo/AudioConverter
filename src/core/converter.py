@@ -16,6 +16,7 @@ class AudioConverter:
             self,
             task: AudioTask,
             log_callback=None,
+            cancellation_event=None,
     ):
 
         if not task.input_file.exists():
@@ -28,7 +29,14 @@ class AudioConverter:
             exist_ok=True
         )
 
-        return self.ffmpeg.convert(task, log_callback=log_callback)
+        return self.ffmpeg.convert(
+            task,
+            log_callback=log_callback,
+            cancellation_event=cancellation_event,
+        )
+
+    def cancel_current_conversion(self):
+        return self.ffmpeg.cancel_current_conversion()
 
     def convert_batch(
             self,

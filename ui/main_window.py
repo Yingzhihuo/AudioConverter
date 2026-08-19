@@ -1,7 +1,9 @@
 from pathlib import Path
+import threading
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -21,10 +23,73 @@ from PySide6.QtWidgets import (
 )
 
 from src.core.audio_codec import AudioCodec
+from src.core.ffmpeg_service import ConversionCancelled
 from src.models.audio_task import AudioTask
 
 
 AUDIO_FILE_FILTER = "Audio Files (*.mp3 *.wav *.flac *.m4a *.ogg)"
+AUDIO_FILE_EXTENSIONS = {".mp3", ".wav", ".flac", ".m4a", ".ogg"}
+
+CODEC_PREVIEW_DETAILS = {
+    AudioCodec.MP3: ("有损压缩", "编码器默认"),
+    AudioCodec.AAC: ("有损压缩", "编码器默认"),
+    AudioCodec.FLAC: ("无损压缩", "无损，由音频内容决定"),
+    AudioCodec.WAV: ("无压缩 PCM", "随采样率和声道数变化"),
+    AudioCodec.OPUS: ("有损压缩", "编码器默认"),
+    AudioCodec.OGG: ("有损压缩", "编码器默认"),
+}
+
+
+class AudioFileListWidget(QListWidget):
+    """A file list that accepts supported local audio files by drag and drop."""
+
+    files_dropped = Signal(list, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+
+    @staticmethod
+    def audio_files_from_mime_data(mime_data):
+        files = []
+        rejected = 0
+        if not mime_data.hasUrls():
+            return files, rejected
+
+        for url in mime_data.urls():
+            if not url.isLocalFile():
+                rejected += 1
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_file() and path.suffix.lower() in AUDIO_FILE_EXTENSIONS:
+                files.append(str(path))
+            else:
+                rejected += 1
+        return files, rejected
+
+    def dragEnterEvent(self, event):
+        files, _ = self.audio_files_from_mime_data(event.mimeData())
+        if files:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        files, _ = self.audio_files_from_mime_data(event.mimeData())
+        if files:
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        files, rejected = self.audio_files_from_mime_data(event.mimeData())
+        if not files:
+            event.ignore()
+            return
+        self.files_dropped.emit(files, rejected)
+        event.acceptProposedAction()
 
 
 class ConversionWorker(QObject):
@@ -33,12 +98,18 @@ class ConversionWorker(QObject):
     log_message = Signal(str)
     progress_changed = Signal(int, int)
     completed = Signal(list)
+    cancelled = Signal(list, int)
     failed = Signal(str)
 
     def __init__(self, converter, tasks):
         super().__init__()
         self.converter = converter
         self.tasks = tasks
+        self.cancellation_event = threading.Event()
+
+    def request_cancel(self):
+        self.cancellation_event.set()
+        self.converter.cancel_current_conversion()
 
     @Slot()
     def run(self):
@@ -46,12 +117,24 @@ class ConversionWorker(QObject):
             outputs = []
             total = len(self.tasks)
             for index, task in enumerate(self.tasks, start=1):
+                if self.cancellation_event.is_set():
+                    self.cancelled.emit(outputs, total)
+                    return
                 self.log_message.emit(f"[{index}/{total}] \u5f00\u59cb\u8f6c\u6362\uff1a{task.input_file.name}")
-                self.converter.convert(task, log_callback=self.log_message.emit)
+                self.converter.convert(
+                    task,
+                    log_callback=self.log_message.emit,
+                    cancellation_event=self.cancellation_event,
+                )
                 outputs.append(str(task.output_file))
                 self.progress_changed.emit(index, total)
                 self.log_message.emit(f"[{index}/{total}] \u8f6c\u6362\u5b8c\u6210\uff1a{task.output_file}")
-            self.completed.emit(outputs)
+            if self.cancellation_event.is_set():
+                self.cancelled.emit(outputs, total)
+            else:
+                self.completed.emit(outputs)
+        except ConversionCancelled:
+            self.cancelled.emit(outputs, total)
         except Exception as error:
             self.failed.emit(str(error))
 
@@ -103,9 +186,11 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.remove_btn)
         file_layout.addLayout(button_layout)
 
-        self.file_list = QListWidget()
+        self.file_list = AudioFileListWidget()
+        self.file_list.setToolTip("\u53ef\u5c06\u97f3\u9891\u6587\u4ef6\u62d6\u62fd\u5230\u6b64\u5904\u5bfc\u5165")
         self.file_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.file_list.itemSelectionChanged.connect(self.update_remove_button)
+        self.file_list.files_dropped.connect(self.import_dropped_conversion_files)
         file_layout.addWidget(self.file_list, stretch=1)
         content_layout.addWidget(file_group, stretch=3)
 
@@ -115,6 +200,7 @@ class MainWindow(QMainWindow):
         self.codec_box = QComboBox()
         for codec in AudioCodec:
             self.codec_box.addItem(codec.display_name, codec)
+        self.codec_box.currentIndexChanged.connect(self.update_codec_preview)
         operation_layout.addWidget(self.codec_box, 1, 0)
 
         self.convert_btn = QPushButton("\u5f00\u59cb\u8f6c\u6362")
@@ -124,7 +210,27 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setFormat("0 / 0")
         operation_layout.addWidget(self.progress, 4, 0)
-        operation_layout.setRowStretch(5, 1)
+        self.cancel_btn = QPushButton("\u53d6\u6d88")
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setStyleSheet(
+            "QPushButton { color: #c62828; font-weight: bold; }"
+            "QPushButton:disabled { color: #c98b8b; }"
+        )
+        self.cancel_btn.clicked.connect(self.cancel_conversion)
+        operation_layout.addWidget(self.cancel_btn, 4, 1)
+        operation_layout.setColumnStretch(0, 1)
+
+        operation_layout.addWidget(QLabel("\u8f93\u51fa\u9884\u89c8"), 5, 0, 1, 2)
+        self.codec_preview = QLabel()
+        self.codec_preview.setWordWrap(True)
+        self.codec_preview.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        self.codec_preview.setStyleSheet(
+            "QLabel { background-color: #f7f7f7; border: 1px solid #c7c7c7; "
+            "padding: 7px; color: #333333; }"
+        )
+        operation_layout.addWidget(self.codec_preview, 6, 0, 1, 2)
+        operation_layout.setRowStretch(6, 1)
+        self.update_codec_preview()
         content_layout.addWidget(operation_group, stretch=2)
 
         log_group = QGroupBox("\u65e5\u5fd7")
@@ -169,9 +275,11 @@ class MainWindow(QMainWindow):
         button_layout.addWidget(self.metadata_remove_btn)
         file_layout.addLayout(button_layout)
 
-        self.metadata_file_list = QListWidget()
+        self.metadata_file_list = AudioFileListWidget()
+        self.metadata_file_list.setToolTip("\u53ef\u5c06\u97f3\u9891\u6587\u4ef6\u62d6\u62fd\u5230\u6b64\u5904\u5bfc\u5165")
         self.metadata_file_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
         self.metadata_file_list.currentRowChanged.connect(self.load_selected_metadata)
+        self.metadata_file_list.files_dropped.connect(self.import_dropped_metadata_files)
         file_layout.addWidget(self.metadata_file_list, stretch=1)
         content_layout.addWidget(file_group, stretch=2)
 
@@ -248,6 +356,22 @@ class MainWindow(QMainWindow):
         scrollbar = self.log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
+    def update_codec_preview(self):
+        codec = self.codec_box.currentData()
+        if codec is None:
+            self.codec_preview.clear()
+            return
+
+        compression_type, bitrate = CODEC_PREVIEW_DETAILS[codec]
+        self.codec_preview.setText(
+            f"\u683c\u5f0f\uff1a{codec.display_name} ({codec.extension})\n"
+            f"\u7f16\u7801\u5668\uff1a{codec.ffmpeg_codec}\n"
+            f"\u7c7b\u578b\uff1a{compression_type}\n"
+            f"\u7801\u7387\uff1a{bitrate}\n"
+            "\u91c7\u6837\u7387\uff1a\u4fdd\u6301\u6e90\u6587\u4ef6\n"
+            "\u58f0\u9053\uff1a\u4fdd\u6301\u6e90\u6587\u4ef6"
+        )
+
     def open_audio_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "\u9009\u62e9\u97f3\u9891\u6587\u4ef6", "", AUDIO_FILE_FILTER)
         return files
@@ -274,6 +398,27 @@ class MainWindow(QMainWindow):
             self.file_list.addItem(Path(file).name)
             self.file_list.item(self.file_list.count() - 1).setToolTip(file)
         self.update_remove_button()
+
+    @staticmethod
+    def normalized_path_key(file):
+        return str(Path(file).resolve()).casefold()
+
+    def import_dropped_conversion_files(self, files, rejected):
+        existing = {self.normalized_path_key(file) for file in self.input_files}
+        added = []
+        for file in files:
+            key = self.normalized_path_key(file)
+            if key not in existing:
+                existing.add(key)
+                added.append(file)
+
+        if added:
+            self.set_input_files([*self.input_files, *added])
+        skipped = rejected + len(files) - len(added)
+        message = f"\u5df2\u901a\u8fc7\u62d6\u62fd\u5bfc\u5165 {len(added)} \u4e2a\u5f85\u8f6c\u6362\u6587\u4ef6"
+        if skipped:
+            message += f"\uff0c\u8df3\u8fc7 {skipped} \u4e2a\u4e0d\u652f\u6301\u6216\u91cd\u590d\u7684\u6587\u4ef6"
+        self.append_log(message)
 
     def update_remove_button(self):
         self.remove_btn.setEnabled(self.file_list.currentRow() >= 0)
@@ -314,6 +459,24 @@ class MainWindow(QMainWindow):
         else:
             self.load_selected_metadata(-1)
         self.update_metadata_controls()
+
+    def import_dropped_metadata_files(self, files, rejected):
+        existing = {self.normalized_path_key(file) for file in self.metadata_files}
+        added = []
+        for file in files:
+            key = self.normalized_path_key(file)
+            if key not in existing:
+                existing.add(key)
+                added.append(file)
+
+        current_row = self.metadata_file_list.currentRow()
+        if added:
+            self.set_metadata_files([*self.metadata_files, *added], current_row)
+        skipped = rejected + len(files) - len(added)
+        message = f"\u5df2\u901a\u8fc7\u62d6\u62fd\u5bfc\u5165 {len(added)} \u4e2a\u5f85\u4fee\u6539\u6587\u4ef6"
+        if skipped:
+            message += f"\uff0c\u8df3\u8fc7 {skipped} \u4e2a\u4e0d\u652f\u6301\u6216\u91cd\u590d\u7684\u6587\u4ef6"
+        self.append_log(message)
 
     def remove_selected_metadata_file(self):
         row = self.metadata_file_list.currentRow()
@@ -434,8 +597,10 @@ class MainWindow(QMainWindow):
         self.worker.log_message.connect(self.append_log)
         self.worker.progress_changed.connect(self.update_progress)
         self.worker.completed.connect(self.on_completed)
+        self.worker.cancelled.connect(self.on_cancelled)
         self.worker.failed.connect(self.on_failed)
         self.worker.completed.connect(self.thread.quit)
+        self.worker.cancelled.connect(self.thread.quit)
         self.worker.failed.connect(self.thread.quit)
         self.thread.finished.connect(self.worker.deleteLater)
         self.thread.finished.connect(self.thread.deleteLater)
@@ -448,13 +613,31 @@ class MainWindow(QMainWindow):
         self.progress.setFormat(f"{current} / {total}")
 
     def on_completed(self, outputs):
+        self.cancel_btn.setEnabled(False)
         self.append_log(f"\u5168\u90e8\u8f6c\u6362\u5b8c\u6210\uff0c\u5171 {len(outputs)} \u4e2a\u6587\u4ef6\u3002")
 
+    def cancel_conversion(self):
+        if self.worker is None or not self.cancel_btn.isEnabled():
+            return
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("\u6b63\u5728\u53d6\u6d88\u2026")
+        self.append_log("\u6b63\u5728\u53d6\u6d88\u8f6c\u6362\uff0c\u8bf7\u7a0d\u5019\u2026")
+        self.worker.request_cancel()
+
+    def on_cancelled(self, outputs, total):
+        self.cancel_btn.setEnabled(False)
+        self.append_log(
+            f"\u8f6c\u6362\u5df2\u53d6\u6d88\uff1a\u5df2\u5b8c\u6210 {len(outputs)} \u4e2a\uff0c"
+            f"\u672a\u5904\u7406 {total - len(outputs)} \u4e2a\u3002"
+        )
+
     def on_failed(self, error):
+        self.cancel_btn.setEnabled(False)
         self.append_log(f"\u8f6c\u6362\u5931\u8d25\uff1a{error}")
 
     def on_thread_finished(self):
         self.set_controls_enabled(True)
+        self.cancel_btn.setText("\u53d6\u6d88")
         self.thread = None
         self.worker = None
 
@@ -467,6 +650,8 @@ class MainWindow(QMainWindow):
         self.settings_btn.setEnabled(enabled)
         self.choose_btn.setEnabled(enabled)
         self.add_btn.setEnabled(enabled)
+        self.file_list.setEnabled(enabled)
         self.codec_box.setEnabled(enabled)
         self.convert_btn.setEnabled(enabled)
+        self.cancel_btn.setEnabled(not enabled)
         self.remove_btn.setEnabled(enabled and self.file_list.currentRow() >= 0)

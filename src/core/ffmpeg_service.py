@@ -3,14 +3,22 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import uuid
 
 from src.models.audio_task import AudioTask
+
+
+class ConversionCancelled(Exception):
+    """Raised when the user cancels an active conversion."""
 
 
 class FFmpegService:
 
     def __init__(self, ffmpeg_path: str):
         self.ffmpeg = Path(ffmpeg_path)
+        self._conversion_lock = threading.Lock()
+        self._active_conversion_process = None
 
     def check_ffmpeg(self) -> bool:
         return self.ffmpeg.exists()
@@ -108,10 +116,33 @@ class FFmpegService:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
 
-    def convert(self, task: AudioTask, log_callback=None):
+    def cancel_current_conversion(self) -> bool:
+        """Request termination of the currently running conversion process."""
+        with self._conversion_lock:
+            process = self._active_conversion_process
+            if process is None or process.poll() is not None:
+                return False
+            try:
+                process.terminate()
+            except OSError:
+                return False
+            else:
+                return True
+
+    def convert(self, task: AudioTask, log_callback=None, cancellation_event=None):
+        if cancellation_event is not None and cancellation_event.is_set():
+            raise ConversionCancelled()
+        if not task.overwrite and task.output_file.exists():
+            raise FileExistsError(task.output_file)
+
+        # 使用目标目录内的临时文件，成功后才替换正式输出。取消时不会
+        # 留下残缺的最终文件，也不会破坏已经存在的同名文件。
+        temporary_output = task.output_file.with_name(
+            f".{task.output_file.stem}.{uuid.uuid4().hex}.part{task.output_file.suffix}"
+        )
         command = [
             str(self.ffmpeg),
-            "-y" if task.overwrite else "-n",
+            "-y",
             "-i",
             str(task.input_file),
         ]
@@ -124,33 +155,46 @@ class FFmpegService:
             command.extend(["-ar", str(task.sample_rate)])
         if task.channels:
             command.extend(["-ac", str(task.channels)])
-        command.append(str(task.output_file))
+        command.append(str(temporary_output))
 
         if log_callback:
             log_callback("执行命令: " + subprocess.list2cmdline(command))
 
-        # FFmpeg 将大部分运行信息写入 stderr。合并输出后逐行发送到界面。
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-        )
-        output_lines = []
+        process = None
+        try:
+            # FFmpeg 将大部分运行信息写入 stderr。合并输出后逐行发送到界面。
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            with self._conversion_lock:
+                self._active_conversion_process = process
+                if cancellation_event is not None and cancellation_event.is_set():
+                    process.terminate()
 
-        assert process.stdout is not None
-        for line in process.stdout:
-            message = line.rstrip()
-            output_lines.append(message)
-            if log_callback and message:
-                log_callback(message)
+            output_lines = []
+            assert process.stdout is not None
+            for line in process.stdout:
+                message = line.rstrip()
+                output_lines.append(message)
+                if log_callback and message:
+                    log_callback(message)
 
-        return_code = process.wait()
-        if return_code != 0:
-            raise RuntimeError("FFmpeg 转换失败（退出码 {}）".format(return_code))
+            return_code = process.wait()
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise ConversionCancelled()
+            if return_code != 0:
+                raise RuntimeError("FFmpeg 转换失败（退出码 {}）".format(return_code))
 
-        return subprocess.CompletedProcess(command, return_code, "\n".join(output_lines))
-
+            os.replace(temporary_output, task.output_file)
+            return subprocess.CompletedProcess(command, return_code, "\n".join(output_lines))
+        finally:
+            with self._conversion_lock:
+                if self._active_conversion_process is process:
+                    self._active_conversion_process = None
+            temporary_output.unlink(missing_ok=True)

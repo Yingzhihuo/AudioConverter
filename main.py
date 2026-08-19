@@ -2,7 +2,6 @@ import sys
 from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
-
 from src.config.config_manager import ConfigManager
 from src.core.ffmpeg_service import FFmpegService
 from src.core.converter import AudioConverter
